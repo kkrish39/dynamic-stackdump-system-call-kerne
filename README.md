@@ -1,1 +1,1 @@
-# dynamic-stackdump-system-call-kerne
+# dynamic-stackdump-system-call-kernel
