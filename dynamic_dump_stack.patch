@@ -1,0 +1,322 @@
+diff -uNr kernel.old/arch/x86/include/asm/syscalls.h kernel.new/arch/x86/include/asm/syscalls.h
+--- kernel.old/arch/x86/include/asm/syscalls.h	2017-06-17 10:44:31.000000000 -0700
++++ kernel.new/arch/x86/include/asm/syscalls.h	2020-04-27 22:42:08.392273000 -0700
+@@ -50,5 +50,7 @@
+ asmlinkage long sys_mmap(unsigned long, unsigned long, unsigned long,
+ 			 unsigned long, unsigned long, unsigned long);
+ 
++asmlinkage long sys_insdump(void __user *, unsigned int);
++asmlinkage long sys_rmdump(unsigned int);
+ #endif /* CONFIG_X86_32 */
+ #endif /* _ASM_X86_SYSCALLS_H */
+diff -uNr kernel.old/arch/x86/syscalls/syscall_32.tbl kernel.new/arch/x86/syscalls/syscall_32.tbl
+--- kernel.old/arch/x86/syscalls/syscall_32.tbl	2017-06-17 10:44:31.000000000 -0700
++++ kernel.new/arch/x86/syscalls/syscall_32.tbl	2020-04-27 22:39:57.849402000 -0700
+@@ -365,3 +365,5 @@
+ 356	i386	memfd_create		sys_memfd_create
+ 357	i386	bpf			sys_bpf
+ 358	i386	execveat		sys_execveat			stub32_execveat
++359	i386	insdump			sys_insdump
++360	i386	rmdump			sys_rmdump
+diff -uNr kernel.old/include/linux/dynamic_dump_stack.h kernel.new/include/linux/dynamic_dump_stack.h
+--- kernel.old/include/linux/dynamic_dump_stack.h	1969-12-31 17:00:00.000000000 -0700
++++ kernel.new/include/linux/dynamic_dump_stack.h	2020-05-01 02:12:54.548800000 -0700
+@@ -0,0 +1 @@
++extern int remove_all_dynamic_dumps(pid_t process_id);
+diff -uNr kernel.old/include/linux/kallsyms.h kernel.new/include/linux/kallsyms.h
+--- kernel.old/include/linux/kallsyms.h	2017-06-17 10:38:33.000000000 -0700
++++ kernel.new/include/linux/kallsyms.h	2020-05-01 14:48:43.782113833 -0700
+@@ -19,6 +19,9 @@
+ /* Lookup the address for a symbol. Returns 0 if not found. */
+ unsigned long kallsyms_lookup_name(const char *name);
+ 
++/* Function to check if a given address lies in the kernel text section */
++unsigned long is_kernel_in_text_section(unsigned long addr);
++
+ /* Call a function on each kallsyms symbol in the core kernel */
+ int kallsyms_on_each_symbol(int (*fn)(void *, const char *, struct module *,
+ 				      unsigned long),
+diff -uNr kernel.old/kernel/exit.c kernel.new/kernel/exit.c
+--- kernel.old/kernel/exit.c	2017-06-17 10:44:58.000000000 -0700
++++ kernel.new/kernel/exit.c	2020-05-01 02:12:23.585271000 -0700
+@@ -59,6 +59,8 @@
+ #include <asm/pgtable.h>
+ #include <asm/mmu_context.h>
+ 
++#include <linux/dynamic_dump_stack.h>
++
+ static void exit_mm(struct task_struct *tsk);
+ 
+ static void __unhash_process(struct task_struct *p, bool group_dead)
+@@ -744,7 +746,9 @@
+ 	exit_task_namespaces(tsk);
+ 	exit_task_work(tsk);
+ 	exit_thread();
+-
++#ifdef CONFIG_DYNAMIC_DUMP_STACK
++	remove_all_dynamic_dumps(tsk->pid);
++#endif
+ 	/*
+ 	 * Flush inherited counters to the parent - before the parent
+ 	 * gets woken up by child-exit notifications.
+diff -uNr kernel.old/kernel/kallsyms.c kernel.new/kernel/kallsyms.c
+--- kernel.old/kernel/kallsyms.c	2017-06-17 10:44:58.000000000 -0700
++++ kernel.new/kernel/kallsyms.c	2020-04-29 14:38:03.368652000 -0700
+@@ -68,6 +68,10 @@
+ 	return in_gate_area_no_mm(addr);
+ }
+ 
++unsigned long is_kernel_in_text_section(unsigned long addr){
++	return is_kernel_text(addr);
++}
++
+ static inline int is_kernel(unsigned long addr)
+ {
+ 	if (addr >= (unsigned long)_stext && addr <= (unsigned long)_end)
+diff -uNr kernel.old/lib/dynamic_dump_stack.c kernel.new/lib/dynamic_dump_stack.c
+--- kernel.old/lib/dynamic_dump_stack.c	1969-12-31 17:00:00.000000000 -0700
++++ kernel.new/lib/dynamic_dump_stack.c	2020-05-01 14:02:14.778696000 -0700
+@@ -0,0 +1,216 @@
++#include <linux/kernel.h>
++#include <linux/stacktrace.h>
++#include <linux/ptrace.h>
++#include <linux/list.h>
++#include <linux/kprobes.h>
++#include <linux/kallsyms.h>
++#include <linux/types.h>
++#include <linux/slab.h>
++#include <asm/uaccess.h>
++#include <linux/string.h>
++#include <linux/syscalls.h>
++#include <linux/spinlock.h>
++#include <linux/module.h>
++#include <linux/dynamic_dump_stack.h>
++
++/*Assigning the dumpmode_t to type unsigned int*/
++typedef unsigned int dumpmode_t;
++
++/*
++*  dump_object to store the requried data
++*  @dump_mode 
++*  @process_identifier 
++*  @dump_identifier
++*  @kernel probe
++*/
++typedef struct dynamic_dump_stack
++{
++	dumpmode_t dump_mode;
++	pid_t owner_pid;
++	unsigned int dump_id;
++	struct kprobe probe;
++} dynamic_dump_stack;
++
++/*Spinlock to achieve synchronization*/
++DEFINE_SPINLOCK(lock);
++
++/*
++* Defined a separate struct, so that we can extend the dynamic_dump_stack object later with additional information.
++* The structure will be the node for the list that will populated dynamically for every new dynamic dump registration.
++*/
++typedef struct dynamic_dump_stack_list
++{
++	dynamic_dump_stack *dump; 
++	struct list_head node; 
++} dynamic_dump_stack_list;
++
++/*static list_head to act as a dummy head and keep track of all the dynamic dumps inserted in the kernel*/
++static LIST_HEAD(dump_head);
++
++/*beginning the dynamic dump ids' from 100*/
++unsigned int dump_id = 100;
++
++/*function to remove the registed dynamic dumps registered a process on exit.
++* @process_id -id of the exiting process.
++*/
++
++int remove_all_dynamic_dumps(pid_t process_id)
++{
++	dynamic_dump_stack_list *temp = NULL;
++	struct list_head *pos, *q;
++	list_for_each_safe(pos, q, &dump_head)
++	{
++		temp = list_entry(pos, dynamic_dump_stack_list, node);
++		if(temp->dump->owner_pid == process_id){
++			printk("Cleanup Process: Removing the dump with id:%d and process id: %d\n",temp->dump->dump_id, process_id);
++			unregister_kprobe(&temp->dump->probe);
++			kfree(temp->dump);
++			list_del(pos);
++			kfree(temp);
++		}
++	}
++	return 0;
++}
++
++/* 
++*	A pre-handler function which gets called when a breakpoint was hit
++*/
++#ifdef CONFIG_DYNAMIC_DUMP_STACK
++static int pre_handler_dynamic_dump(struct kprobe *p, struct pt_regs *regs)
++{
++	dynamic_dump_stack *dump_probed;
++	
++	/*Accessing the current variable to find the detail about the current running process */
++	struct task_struct *task = current;
++	
++	/*Extracting the dynamic_dump_stack struct with the help of kprobe variable*/
++	dump_probed = container_of(p, dynamic_dump_stack, probe);
++
++	/*
++	* Here we have three cases of dump_mode
++	* 1) dump is allowed only for the process who registered.
++	* 2) dump allowed for all the child processes along with the process who registered.
++	*	 Child process can be created by thread and fork.
++	* 3) open for all the processes 
++	*/
++
++	switch (dump_probed->dump_mode)
++	{
++		case 0:
++			if(dump_probed->owner_pid == task->pid){
++				printk("Owner process access: pid: %d\n",task->pid);
++				dump_stack();	
++			}
++			break;
++		case 1:
++			if((dump_probed->owner_pid == task->pid) || (dump_probed->owner_pid == task->tgid) || (dump_probed->owner_pid == task->real_parent->pid)){
++				printk("Child or thread process access with parent: pid: %d\n",task->pid);
++				dump_stack();
++			}
++			break;
++		default:
++			printk("All processe access: pid: %d\n", task->pid);
++			dump_stack();
++			break;
++	}
++
++	return 0;
++}
++
++/* 
++* A post-handler function to take care of any future operations. It's dummy as part of this assignment
++*/
++void post_handler_dynamic_dump(struct kprobe *p, struct pt_regs *regs, unsigned long flags){
++    /*Nothing to do*/
++}
++
++#endif
++
++
++/*syscall to insert the a dynamic dump to the given symbol name 
++*	@insdump - syscall function name.
++*	@symbolname - Name of the symbol for which the dynamic dump must be inserted.
++*	@mode - User requested dynamic dump mode
++*/
++SYSCALL_DEFINE2(insdump, const char __user *, symbolname, dumpmode_t, mode){
++    #ifdef CONFIG_DYNAMIC_DUMP_STACK
++        /*symbol_address*/
++        unsigned long symbol_addr;
++        /*Logic to check if the given symbol is a valid kallsyms symbol and making sure that it's either present 
++        in the text section of the kernel of module*/
++        if ((symbol_addr = kallsyms_lookup_name(symbolname)) 
++		&& (is_kernel_in_text_section(symbol_addr) || is_module_text_address(symbol_addr))){
++            /*task_struct to get the details of the current running process*/
++            struct task_struct *task = current;
++            int ret;
++            /*Allocating a new dump_stack entry to the given symbol*/
++            dynamic_dump_stack_list *new_dump_entry = kmalloc(sizeof(dynamic_dump_stack_list), GFP_KERNEL);
++    	    spin_lock(&lock);
++
++            /*Allocating memory for the in-built dump object*/
++            new_dump_entry->dump = kmalloc(sizeof(dynamic_dump_stack), GFP_KERNEL);
++            new_dump_entry->dump->dump_mode = mode;
++            new_dump_entry->dump->dump_id = ++dump_id;
++            new_dump_entry->dump->owner_pid = task->pid;
++            memset(&new_dump_entry->dump->probe, 0, sizeof(struct kprobe));
++
++            /*Assigning the values to dynamic_dump_stack_listdynamic_dump_stack_list kprobe structure either to register or remove the probe */
++            new_dump_entry->dump->probe.pre_handler = pre_handler_dynamic_dump;
++            new_dump_entry->dump->probe.post_handler = post_handler_dynamic_dump;
++            new_dump_entry->dump->probe.addr = (kprobe_opcode_t *)symbol_addr;
++        
++            /*Register the constructed kprobe to the given symbol's address
++            * #On registration failure, EINVAL is returned. 
++            */
++            if((ret = register_kprobe(&new_dump_entry->dump->probe) < 0))
++            {
++                printk(KERN_ALERT "Register kprobe failed with error code - %d\n", ret);
++		        spin_unlock(&lock);
++                return -EINVAL;
++            }
++	    
++            /*Initializing the dump_node and adding it to the list*/
++            INIT_LIST_HEAD(&new_dump_entry->node);
++            list_add(&new_dump_entry->node, &dump_head);
++
++            printk("Successfully added a dump entry for process:%d with the dynamic dump_id: %d \n",new_dump_entry->dump->owner_pid, new_dump_entry->dump->dump_id);
++            spin_unlock(&lock);
++	    
++            /*Returning the dynamically dump_id on successful creation*/
++            return new_dump_entry->dump->dump_id;
++        }
++	    /*Failure case where the given symbol is not present in the text section*/
++        return -EINVAL;
++    #endif
++    /*Return value when the dynamic dump stack operation is not configured */
++    return 0;
++}
++
++/*syscall to remove the registered dump
++*	@dumpid - the id of the dynamic dump that needs to be removed
++*/
++SYSCALL_DEFINE1(rmdump, unsigned int, dumpid){
++    #ifdef CONFIG_DYNAMIC_DUMP_STACK
++        /*task_struct to get the details of the current running process*/
++        struct task_struct *task = current;
++
++        dynamic_dump_stack_list *temp = NULL;
++        struct list_head *pos, *q;
++        list_for_each_safe(pos, q, &dump_head)
++        {
++            temp = list_entry(pos, dynamic_dump_stack_list, node);
++            if(temp->dump->dump_id == dumpid && temp->dump->owner_pid == task->pid){
++                unregister_kprobe(&temp->dump->probe);
++                kfree(temp->dump);
++                list_del(pos);
++                kfree(temp);
++                printk("Removing dump entry with id: %d \n", dumpid);
++                return 0;
++            }
++        }
++	    /*Return EINVAL when the given dump_id is not found*/
++        return -EINVAL;
++    #endif
++    /*Return value when the dynamic dump stack operation is not configured */
++    return 0;
++}
+diff -uNr kernel.old/lib/Kconfig.debug kernel.new/lib/Kconfig.debug
+--- kernel.old/lib/Kconfig.debug	2017-06-17 10:44:58.000000000 -0700
++++ kernel.new/lib/Kconfig.debug	2020-05-01 14:30:29.153353502 -0700
+@@ -113,6 +113,12 @@
+ 
+ 	  See Documentation/dynamic-debug-howto.txt for additional information.
+ 
++config DYNAMIC_DUMP_STACK
++	bool "Enabling and disabling dynamic_dump_stack() operation"
++	default n
++	help
++	  Assign Y if you want to enable dynamic_dump_stack and N to disable it
++
+ endmenu # "printk and dmesg options"
+ 
+ menu "Compile-time checks and compiler options"
+diff -uNr kernel.old/lib/Makefile kernel.new/lib/Makefile
+--- kernel.old/lib/Makefile	2017-06-17 10:44:58.000000000 -0700
++++ kernel.new/lib/Makefile	2020-04-27 22:35:39.595642000 -0700
+@@ -22,6 +22,7 @@
+ lib-y	+= kobject.o klist.o
+ obj-y	+= lockref.o
+ 
++obj-y += dynamic_dump_stack.o
+ obj-y += bcd.o div64.o sort.o parser.o halfmd4.o debug_locks.o random32.o \
+ 	 bust_spinlocks.o hexdump.o kasprintf.o bitmap.o scatterlist.o \
+ 	 gcd.o lcm.o list_sort.o uuid.o flex_array.o iovec.o clz_ctz.o \
