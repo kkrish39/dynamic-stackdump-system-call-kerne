@@ -9,7 +9,7 @@ another one for removing the added dump stack.
 - Tested board - Galelio Gen II
 
 - I have defined two syscalls with the syscall numbers as follows:
-- 359 - insdump(syscall_num, SYNBOL_NAME)
+- 359 - insdump(syscall_num, SYMBOL_NAME)
 - 360 - rmdump(dump_id)
 
 - I have modified kallsyms.c and exit.c to export is_kernel_text and to plug in "remove_dynamic_dump" a cleanup routine to remove all the process bounded by CONFIG_DYNAMIC_DUMP_STACK. 
